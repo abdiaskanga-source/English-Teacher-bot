@@ -6,7 +6,7 @@ import os
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
-from openai import OpenAI
+import anthropic
 from telegram import Update, ChatPermissions
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.error import BadRequest, Forbidden
@@ -18,30 +18,21 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-OPENAI_BASE_URL = os.environ["AI_INTEGRATIONS_OPENAI_BASE_URL"]
-OPENAI_API_KEY = os.environ["AI_INTEGRATIONS_OPENAI_API_KEY"]
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 
 TRANSLATE_DELETE_SECONDS = 120
 
 FRENCH_WARN_THRESHOLD = 3
-FRENCH_MUTE1_THRESHOLD = 5   # first mute: 15 minutes
-FRENCH_MUTE2_THRESHOLD = 5   # second mute (after reset): 1 hour
+FRENCH_MUTE1_THRESHOLD = 5
+FRENCH_MUTE2_THRESHOLD = 5
 MUTE1_SECONDS = 15 * 60
 MUTE2_SECONDS = 60 * 60
 
-client = OpenAI(
-    base_url=OPENAI_BASE_URL,
-    api_key=OPENAI_API_KEY,
-)
+client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# --- In-memory French-message counters (reset at midnight) ---
-# french_counts[chat_id][user_id] = int
-# mute_counts[chat_id][user_id]   = int (0 = never muted today, 1 = muted once today)
 french_counts: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
 mute_counts: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
 
-
-# ── Prompts ──────────────────────────────────────────────────────────────────
 
 ANALYSE_PROMPT = """You are an expert English language editor. Analyse the user's message and respond with a JSON object only — no extra text, no markdown fences.
 
@@ -81,46 +72,27 @@ Shape:
 Output ONLY the JSON object."""
 
 
-# ── AI helpers ────────────────────────────────────────────────────────────────
-
 def analyse_message(text: str) -> dict:
-    response = client.chat.completions.create(
-        model="gpt-5-mini",
-        max_completion_tokens=1024,
-        messages=[
-            {"role": "system", "content": ANALYSE_PROMPT},
-            {"role": "user", "content": text},
-        ],
+    response = client.messages.create(
+        model="claude-sonnet-4-5",
+        max_tokens=1024,
+        system=ANALYSE_PROMPT,
+        messages=[{"role": "user", "content": text}],
     )
-    raw = response.choices[0].message.content.strip()
+    raw = response.content[0].text.strip()
     return json.loads(raw)
 
 
 def translate_message(text: str) -> dict:
-    response = client.chat.completions.create(
-        model="gpt-5-mini",
-        max_completion_tokens=1024,
-        messages=[
-            {"role": "system", "content": TRANSLATE_PROMPT},
-            {"role": "user", "content": text},
-        ],
+    response = client.messages.create(
+        model="claude-sonnet-4-5",
+        max_tokens=1024,
+        system=TRANSLATE_PROMPT,
+        messages=[{"role": "user", "content": text}],
     )
-    raw = response.choices[0].message.content.strip()
+    raw = response.content[0].text.strip()
     return json.loads(raw)
 
-
-def transcribe_audio(audio_bytes: bytes, filename: str = "voice.ogg") -> str:
-    audio_file = io.BytesIO(audio_bytes)
-    audio_file.name = filename
-    result = client.audio.transcriptions.create(
-        model="gpt-4o-mini-transcribe",
-        file=audio_file,
-        response_format="json",
-    )
-    return result.text.strip()
-
-
-# ── Formatting helpers ────────────────────────────────────────────────────────
 
 def escape_markdown(text: str) -> str:
     special = r"\_*[]()~`>#+-=|{}.!"
@@ -137,8 +109,6 @@ def format_correction(corrected: str, explanations: list[dict]) -> str:
             lines.append(f"• {escape_markdown(en)}\n  _🇫🇷 {escape_markdown(fr)}_")
     return "\n".join(lines)
 
-
-# ── Utility ───────────────────────────────────────────────────────────────────
 
 def is_bot_mentioned(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     bot_username = context.bot.username
@@ -167,24 +137,19 @@ async def delete_after(chat_id: int, message_id: int, bot, delay: int) -> None:
 
 
 async def midnight_reset_loop() -> None:
-    """Reset all French-message counters every day at midnight UTC."""
     while True:
         now = datetime.now(timezone.utc)
         next_midnight = (now + timedelta(days=1)).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
         sleep_seconds = (next_midnight - now).total_seconds()
-        logger.info("Next counter reset in %.0f seconds (at midnight UTC)", sleep_seconds)
         await asyncio.sleep(sleep_seconds)
         french_counts.clear()
         mute_counts.clear()
         logger.info("French-message counters reset at midnight UTC")
 
 
-# ── French warning / mute logic ───────────────────────────────────────────────
-
 async def handle_french_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Called when a French message is detected in a group and the bot is not mentioned."""
     message = update.message
     chat_id = message.chat_id
     user_id = message.from_user.id
@@ -195,22 +160,16 @@ async def handle_french_message(update: Update, context: ContextTypes.DEFAULT_TY
     count = french_counts[chat_id][user_id]
     already_muted = mute_counts[chat_id][user_id]
 
-    logger.info(
-        "French message from %s (id=%s) in chat %s — count=%s, muted_today=%s",
-        name, user_id, chat_id, count, already_muted,
-    )
-
     if count == FRENCH_WARN_THRESHOLD:
         mention = f"[{escape_markdown(name)}](tg://user?id={user_id})"
         await message.reply_text(
             f"⚠️ {mention}\n\n"
             f"🇫🇷 Merci d'écrire en anglais dans ce groupe\\. "
             f"C'est la {escape_markdown(str(count))}ème fois aujourd'hui — "
-            f"après {escape_markdown(str(FRENCH_MUTE1_THRESHOLD))} messages en français, "
-            f"vous serez temporairement mis\\(e\\) en sourdine\\.\n\n"
+            f"après {escape_markdown(str(FRENCH_MUTE1_THRESHOLD))} messages en français vous serez mis\\(e\\) en sourdine\\.\n\n"
             f"🇬🇧 Please write in English in this group\\. "
             f"This is the {escape_markdown(str(count))}rd time today — "
-            f"after {escape_markdown(str(FRENCH_MUTE1_THRESHOLD))} French messages you will be muted temporarily\\.",
+            f"after {escape_markdown(str(FRENCH_MUTE1_THRESHOLD))} French messages you will be muted\\.",
             parse_mode="MarkdownV2",
         )
 
@@ -240,18 +199,13 @@ async def handle_french_message(update: Update, context: ContextTypes.DEFAULT_TY
             await message.reply_text(
                 f"🔇 {mention}\n\n"
                 f"🇫🇷 Vous avez été mis\\(e\\) en sourdine pendant *{escape_markdown(duration_fr)}* "
-                f"pour avoir écrit en français à plusieurs reprises\\. "
-                f"Veuillez utiliser l'anglais dans ce groupe\\.\n\n"
+                f"pour avoir écrit en français à plusieurs reprises\\.\n\n"
                 f"🇬🇧 You have been muted for *{escape_markdown(duration_en)}* "
-                f"for repeatedly writing in French\\. "
-                f"Please use English in this group\\.",
+                f"for repeatedly writing in French\\.",
                 parse_mode="MarkdownV2",
             )
 
         except Forbidden:
-            logger.warning(
-                "Cannot mute user %s in chat %s — bot lacks admin rights", user_id, chat_id
-            )
             await message.reply_text(
                 "⚠️ I need admin rights to mute members\\. "
                 "Please promote me to admin with the 'Restrict Members' permission\\.",
@@ -260,8 +214,6 @@ async def handle_french_message(update: Update, context: ContextTypes.DEFAULT_TY
         except BadRequest as e:
             logger.error("Failed to mute user %s: %s", user_id, e)
 
-
-# ── Command handlers ──────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
@@ -286,18 +238,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "and style\\. Each correction is explained in English and French\\.\n"
         "I stay silent if your text is already correct\\.\n\n"
         "*Translation* `/translate`\n"
-        "Reply to any message with /translate to get it translated:\n"
-        "• English → French\n"
-        "• French → English\n"
+        "Reply to any message with /translate to get it translated\\.\n"
         "The translation disappears after 2 minutes\\.\n\n"
         "*Voice messages*\n"
-        "Send a voice message — I transcribe it and, if it's in English, "
-        "correct any mistakes with bilingual explanations\\.\n\n"
+        "Send a voice message — I transcribe and correct it if it's in English\\.\n\n"
         "*French language policy* 🇫🇷\n"
-        "French messages in the group are counted per user per day:\n"
-        "• 3 messages → warning\n"
-        "• 5 messages → muted for 15 minutes\n"
-        "• 5 more after unmute → muted for 1 hour\n"
+        "• 3 French messages → warning\n"
+        "• 5 messages → muted 15 minutes\n"
+        "• 5 more → muted 1 hour\n"
         "Counters reset at midnight UTC\\.",
         parse_mode="MarkdownV2",
     )
@@ -353,8 +301,6 @@ async def translate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     )
 
 
-# ── Message handlers ──────────────────────────────────────────────────────────
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     if not message or not message.text:
@@ -371,10 +317,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     try:
         result = analyse_message(user_text)
     except Exception as e:
-        logger.error("Error calling OpenAI or parsing response: %s", e)
-        await message.reply_text(
-            "⚠️ Something went wrong while processing your text. Please try again."
-        )
+        logger.error("Error calling Claude or parsing response: %s", e)
         return
 
     language = result.get("language", "other")
@@ -406,55 +349,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
 
 
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.message
-    if not message or not message.voice:
-        return
-
-    await message.chat.send_action("typing")
-
-    try:
-        voice_file = await message.voice.get_file()
-        audio_bytes = bytes(await voice_file.download_as_bytearray())
-    except Exception as e:
-        logger.error("Failed to download voice message: %s", e)
-        return
-
-    try:
-        transcript = transcribe_audio(audio_bytes, filename="voice.ogg")
-    except Exception as e:
-        logger.error("Transcription error: %s", e)
-        await message.reply_text("⚠️ I couldn't transcribe that voice message. Please try again.")
-        return
-
-    if not transcript:
-        return
-
-    logger.info("Transcribed voice: %s", transcript)
-
-    try:
-        result = analyse_message(transcript)
-    except Exception as e:
-        logger.error("Analysis error after transcription: %s", e)
-        return
-
-    language = result.get("language", "other")
-    has_mistakes = result.get("has_mistakes", False)
-    corrected = result.get("corrected", "")
-    explanations = result.get("explanations", [])
-
-    if language != "english" or not has_mistakes:
-        return
-
-    reply = (
-        f"🎙️ *Transcription:*\n_{escape_markdown(transcript)}_\n\n"
-        + format_correction(corrected, explanations)
-    )
-    await message.reply_text(reply, parse_mode="MarkdownV2")
-
-
-# ── Entry point ───────────────────────────────────────────────────────────────
-
 async def post_init(app: Application) -> None:
     asyncio.create_task(midnight_reset_loop())
     logger.info("Midnight reset loop started")
@@ -478,5 +372,60 @@ def main() -> None:
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if not message or not message.voice:
+        return
+
+    await message.chat.send_action("typing")
+
+    try:
+        voice_file = await message.voice.get_file()
+        audio_bytes = bytes(await voice_file.download_as_bytearray())
+    except Exception as e:
+        logger.error("Failed to download voice message: %s", e)
+        return
+
+    # For voice, we use Claude to transcribe via base64
+    import base64
+    audio_b64 = base64.standard_b64encode(audio_bytes).decode("utf-8")
+
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=1024,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Transcribe this voice message, then analyse it for English mistakes. Respond with JSON only: {\"transcript\": \"...\", \"language\": \"english|french|other\", \"has_mistakes\": true|false, \"corrected\": \"...\", \"explanations\": [{\"en\": \"...\", \"fr\": \"...\"}]}"
+                    }
+                ]
+            }]
+        )
+        result = json.loads(response.content[0].text.strip())
+    except Exception as e:
+        logger.error("Voice analysis error: %s", e)
+        await message.reply_text("⚠️ I couldn't process that voice message. Please try again.")
+        return
+
+    language = result.get("language", "other")
+    has_mistakes = result.get("has_mistakes", False)
+    transcript = result.get("transcript", "")
+    corrected = result.get("corrected", "")
+    explanations = result.get("explanations", [])
+
+    if language != "english" or not has_mistakes:
+        return
+
+    reply = (
+        f"🎙️ *Transcription:*\n_{escape_markdown(transcript)}_\n\n"
+        + format_correction(corrected, explanations)
+    )
+    await message.reply_text(reply, parse_mode="MarkdownV2")
+
+
 if __name__ == "__main__":
     main()
+
